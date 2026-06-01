@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import { parseCsvDataset, DatasetParseError } from "./api/dataset";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { parseCsvDataset, DatasetParseError, ZONE_THRESHOLDS } from "./api/dataset";
 import { Header } from "./components/Header";
 import { DataSourcePanel } from "./components/DataSourcePanel";
 import { ControlBar } from "./components/ControlBar";
+import { KpiCards } from "./components/KpiCards";
+import { TimelineChart } from "./components/TimelineChart";
+import { PipelinePanel } from "./components/PipelinePanel";
+import { VerdictPanel } from "./components/VerdictPanel";
 
 export default function SolarEdgeDashboard() {
   // 데이터 상태
@@ -20,7 +24,6 @@ export default function SolarEdgeDashboard() {
   const totalPoints = points?.length ?? 0;
   const hasData = !!points && totalPoints > 0;
 
-  // 시뮬레이션 루프
   useEffect(() => {
     if (!playing || !hasData) return;
     intervalRef.current = setInterval(() => {
@@ -64,7 +67,88 @@ export default function SolarEdgeDashboard() {
     setLoadState("idle");
   }, []);
 
+  const visibleData = useMemo(
+    () => (hasData ? points.slice(0, cursor + 1) : []),
+    [points, cursor, hasData]
+  );
   const currentPoint = hasData ? points[cursor] : null;
+
+  // 파이프라인 단계 상태
+  const moduleStatus = useMemo(() => {
+    if (!currentPoint) return { stage1: "idle", stage2: "idle", stage3: "idle" };
+    const ghi = currentPoint.ghi ?? 0;
+    const inDetectorRange = ghi >= 200;
+    const zone = currentPoint.ghiZone;
+    const thr = ZONE_THRESHOLDS[zone];
+    const isFlagged =
+      currentPoint.attackLabel === 1 ||
+      (currentPoint.attackProb != null && thr != null && currentPoint.attackProb >= thr);
+
+    return {
+      stage1: ghi > 0 ? "active" : "idle",
+      stage2: inDetectorRange ? "active" : "idle",
+      stage3: isFlagged ? "alert" : inDetectorRange ? "active" : "idle",
+    };
+  }, [currentPoint]);
+
+  // 통계
+  const stats = useMemo(() => {
+    if (!hasData) {
+      return {
+        labeledHits: 0,
+        predictedHits: 0,
+        alerts: 0,
+        attackTypes: {},
+        meanResidualRaw: null,
+        meanResidualPr: null,
+        meanGhi: null,
+        zoneCounts: { excluded: 0, mid: 0, high: 0 },
+      };
+    }
+    let labeledHits = 0;
+    let predictedHits = 0;
+    const attackTypes = {};
+    let residRawSum = 0, residRawN = 0;
+    let residPrSum = 0, residPrN = 0;
+    let ghiSum = 0, ghiN = 0;
+    const zoneCounts = { excluded: 0, mid: 0, high: 0 };
+
+    for (const p of visibleData) {
+      if (p.attackLabel === 1) {
+        labeledHits++;
+        const t = p.attackType ?? "ATTACK";
+        attackTypes[t] = (attackTypes[t] ?? 0) + 1;
+      }
+      const thr = ZONE_THRESHOLDS[p.ghiZone];
+      if (p.attackProb != null && thr != null && p.attackProb >= thr) predictedHits++;
+      if (p.residualRaw != null) { residRawSum += p.residualRaw; residRawN++; }
+      if (p.residualPr != null) { residPrSum += p.residualPr; residPrN++; }
+      if (p.ghi != null) { ghiSum += p.ghi; ghiN++; }
+      zoneCounts[p.ghiZone] = (zoneCounts[p.ghiZone] ?? 0) + 1;
+    }
+
+    return {
+      labeledHits,
+      predictedHits,
+      alerts: labeledHits + predictedHits,
+      attackTypes,
+      meanResidualRaw: residRawN > 0 ? residRawSum / residRawN : null,
+      meanResidualPr: residPrN > 0 ? residPrSum / residPrN : null,
+      meanGhi: ghiN > 0 ? ghiSum / ghiN : null,
+      zoneCounts,
+    };
+  }, [visibleData, hasData]);
+
+  // 최종 판정
+  const verdict = useMemo(() => {
+    if (!hasData) return { state: "no-data", reachedEnd: false };
+    const reachedEnd = cursor >= totalPoints - 1;
+    const hits = stats.labeledHits + stats.predictedHits;
+
+    if (hits === 0) return { state: "monitoring", reachedEnd };
+    if (reachedEnd) return { state: "confirmed", reachedEnd };
+    return { state: "suspect", reachedEnd };
+  }, [cursor, stats.labeledHits, stats.predictedHits, hasData, totalPoints]);
 
   const handlePlay = () => {
     if (!hasData) return;
@@ -83,6 +167,7 @@ export default function SolarEdgeDashboard() {
 
   return (
     <div className="relative min-h-screen text-zinc-900 p-6 overflow-hidden bg-gradient-to-b from-blue-50/50 via-white via-30% to-amber-50/30">
+      {/* 페이지 전체 floating blob 장식 (가장 뒤) */}
       <div className="pointer-events-none absolute -top-32 -left-32 w-[520px] h-[520px] rounded-full bg-blue-200/30 blur-3xl" />
       <div className="pointer-events-none absolute top-[40%] -right-32 w-[460px] h-[460px] rounded-full bg-amber-200/25 blur-3xl" />
       <div className="pointer-events-none absolute top-[70%] left-[20%] w-[400px] h-[400px] rounded-full bg-emerald-200/20 blur-3xl" />
@@ -91,6 +176,7 @@ export default function SolarEdgeDashboard() {
       <div className="relative max-w-[1600px] mx-auto space-y-5">
         <Header loadState={loadState} dataset={dataset} />
 
+        {/* 데이터 없을 때만 업로드 패널 펼치고, 로드되면 상단 ControlBar 안으로 컴팩트하게 */}
         {!hasData && (
           <DataSourcePanel
             loadState={loadState}
@@ -114,6 +200,26 @@ export default function SolarEdgeDashboard() {
           hasData={hasData}
         />
 
+        <KpiCards stats={stats} currentPoint={currentPoint} hasData={hasData} dataset={dataset} />
+
+        <div className="grid grid-cols-12 gap-5">
+          <div className="col-span-12 xl:col-span-8">
+            <TimelineChart
+              data={visibleData}
+              detections={dataset?.detections ?? []}
+              hasData={hasData}
+              loadState={loadState}
+              dataset={dataset}
+            />
+          </div>
+          <div className="col-span-12 xl:col-span-4">
+            <PipelinePanel status={moduleStatus} currentPoint={currentPoint} dataset={dataset} />
+          </div>
+        </div>
+
+        <VerdictPanel verdict={verdict} stats={stats} dataset={dataset} cursor={cursor} />
+
+        {/* 데이터 로드된 상태에서 작은 "다시 업로드" 영역 */}
         {hasData && (
           <div className="flex justify-center">
             <button
