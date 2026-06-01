@@ -1,1 +1,1 @@
-# TrueRay_Solar-Anomaly-Detection
+# Solar-Anomaly-Detection
